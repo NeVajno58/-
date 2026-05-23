@@ -14,6 +14,9 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 warnings.filterwarnings("ignore")
 
 
+WEB_CHART_LINE_WIDTH = 2
+
+
 # ============================================================
 # Загрузка данных
 # ============================================================
@@ -412,11 +415,93 @@ def summarize_validation_results(results_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("MAE") if rows else pd.DataFrame()
 
 
+def format_factor_columns(columns: list[str], limit: int = 12) -> str:
+    if not columns:
+        return "нет"
+
+    visible_columns = columns[:limit]
+    result = ", ".join(visible_columns)
+
+    if len(columns) > limit:
+        result += f" и ещё {len(columns) - limit}"
+
+    return result
+
+
+def describe_forecast_factors(
+    model_type: str,
+    horizon: int,
+    train_window_hours: int,
+    order: tuple[int, int, int],
+    seasonal_order: tuple[int, int, int, int],
+    train: pd.Series,
+    remove_anomalies: bool,
+    regressors: pd.DataFrame | None = None
+) -> list[str]:
+    train_tail = train.iloc[-train_window_hours:]
+    actual_train_hours = len(train_tail)
+    factors = [
+        f"исторические значения traffic_volume за последние {actual_train_hours} часов обучающего окна",
+        f"горизонт прогноза: {horizon} часов",
+        f"обработка аномалий: {'включена' if remove_anomalies else 'не применялась'}"
+    ]
+
+    if len(train_tail) > 0:
+        factors.append(
+            f"период данных для обучения выбранной модели: {train_tail.index.min()} - {train_tail.index.max()}"
+        )
+
+    if model_type == "ARIMA":
+        factors.append(
+            f"параметры ARIMA: p={order[0]}, d={order[1]}, q={order[2]}; модель использует автозависимость, тренд после дифференцирования и прошлые ошибки прогноза"
+        )
+
+    elif model_type == "SARIMA":
+        factors.append(
+            f"параметры SARIMA: p={order[0]}, d={order[1]}, q={order[2]}, P={seasonal_order[0]}, D={seasonal_order[1]}, Q={seasonal_order[2]}, сезонный период={seasonal_order[3]}"
+        )
+        factors.append("учтена сезонная повторяемость временного ряда")
+
+    elif model_type == "SARIMAX":
+        active_regressors = remove_constant_regressors(
+            regressors,
+            reference_index=train_tail.index
+        )
+        active_columns = list(active_regressors.columns)
+        factors.append(
+            f"параметры SARIMAX: p={order[0]}, d={order[1]}, q={order[2]}, P={seasonal_order[0]}, D={seasonal_order[1]}, Q={seasonal_order[2]}, сезонный период={seasonal_order[3]}"
+        )
+        factors.append(
+            "внешние признаки, использованные моделью: "
+            + format_factor_columns(active_columns)
+        )
+
+    elif model_type == "Prophet":
+        calendar_columns = ["hour", "day_of_week", "is_weekend", "month"]
+        active_regressors = remove_constant_regressors(
+            regressors,
+            reference_index=train_tail.index
+        )
+        extra_columns = [
+            column for column in active_regressors.columns
+            if column not in calendar_columns
+        ]
+        factors.append("компоненты Prophet: общий тренд, дневная сезонность и недельная сезонность")
+        factors.append("календарные признаки: час суток, день недели, выходной день, месяц")
+        factors.append(
+            "дополнительные признаки из CSV: "
+            + format_factor_columns(extra_columns)
+        )
+
+    return factors
+
+
 def build_text_report(
     best_model: str,
     metrics_df: pd.DataFrame,
     congestion_df: pd.DataFrame,
-    error_hour_df: pd.DataFrame | None = None
+    error_hour_df: pd.DataFrame | None = None,
+    forecast_factors: list[str] | None = None
 ) -> str:
     """
     Формирование текстового отчёта по результатам прогнозирования.
@@ -424,6 +509,12 @@ def build_text_report(
     report = "ОТЧЁТ ПО ПРОГНОЗИРОВАНИЮ ТРАНСПОРТНОГО ПОТОКА\n"
     report += "=" * 58 + "\n\n"
     report += f"Лучшая модель по выбранной метрике: {best_model}\n\n"
+
+    if forecast_factors:
+        report += "Факторы, на основе которых был сделан прогноз:\n"
+        for factor in forecast_factors:
+            report += f"- {factor}\n"
+        report += "\n"
 
     report += "Метрики качества моделей:\n"
     report += metrics_df.round(2).to_string(index=False)
@@ -1209,6 +1300,35 @@ def plot_forecast_with_interval(
 # Streamlit-интерфейс
 # ============================================================
 
+def render_thick_line_chart(st, data: pd.Series | pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    if isinstance(data, pd.Series):
+        ax.plot(
+            data.index,
+            data.values,
+            label=data.name or "value",
+            linewidth=WEB_CHART_LINE_WIDTH
+        )
+    else:
+        for column in data.columns:
+            ax.plot(
+                data.index,
+                data[column],
+                label=column,
+                linewidth=WEB_CHART_LINE_WIDTH
+            )
+
+    ax.set_xlabel("Дата и время")
+    ax.set_ylabel("traffic_volume")
+    ax.grid(True)
+    ax.legend()
+    fig.autofmt_xdate()
+
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
 def run_streamlit_interface() -> None:
     import streamlit as st
 
@@ -1268,7 +1388,7 @@ def run_streamlit_interface() -> None:
     sarimax_regressors = prepare_sarimax_regressors(data)
 
     st.subheader("Фрагмент подготовленного временного ряда")
-    st.line_chart(series.tail(24 * 7))
+    render_thick_line_chart(st, series.tail(24 * 7))
 
     train, test = split_train_test(series)
 
@@ -1383,7 +1503,7 @@ def run_streamlit_interface() -> None:
                 "SARIMAX использует внешние регрессоры: "
                 + ", ".join(sarimax_regressors.columns)
             )
-        st.line_chart(comparison_chart_df)
+        render_thick_line_chart(st, comparison_chart_df)
         st.dataframe(comparison_metrics_df.round(2), hide_index=True)
 
         best_model_by_mae = select_best_model(comparison_metrics_df, metric="MAE")
@@ -1515,7 +1635,7 @@ def run_streamlit_interface() -> None:
             "Верхняя граница интервала": interval.iloc[:, 1]
         })
 
-        st.line_chart(chart_df)
+        render_thick_line_chart(st, chart_df)
 
         st.subheader("Таблица результатов")
         st.dataframe(result_df)
@@ -1549,11 +1669,29 @@ def run_streamlit_interface() -> None:
             [[model_type, mae, rmse, mape]],
             columns=["model", "MAE", "RMSE", "MAPE"]
         )
+        report_regressors = None
+
+        if model_type == "SARIMAX":
+            report_regressors = sarimax_regressors
+        elif model_type == "Prophet":
+            report_regressors = prophet_regressors
+
+        forecast_factors = describe_forecast_factors(
+            model_type=model_type,
+            horizon=horizon,
+            train_window_hours=train_window_hours,
+            order=order,
+            seasonal_order=seasonal_order,
+            train=train,
+            remove_anomalies=remove_anomalies,
+            regressors=report_regressors
+        )
         report_text = build_text_report(
             best_model=model_type,
             metrics_df=single_model_metrics_df,
             congestion_df=congestion_df,
-            error_hour_df=error_hour_df
+            error_hour_df=error_hour_df,
+            forecast_factors=forecast_factors
         )
 
         csv_result = result_df.to_csv(index=True).encode("utf-8")
